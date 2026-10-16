@@ -1,0 +1,13 @@
+{
+  "name": "vellure-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3"
+  }
+}

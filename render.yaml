@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: vellure-bot
+    runtime: node
+    plan: starter            # free plan sleeps and will miss cron times
+    region: singapore
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: TZ
+        value: Asia/Dhaka
+      - key: SITE_URL
+        value: https://vellurefragrances.com
+      - key: PRODUCTS
+        value: Armani Style,Desire,Aqua Di Gio,Vampire Blood
+      - key: GRAPH_VERSION
+        value: v23.0
+      - key: WHATSAPP_NUMBER
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true   # letters and digits; copy it from the dashboard for /run calls
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_TEXT_MODEL
+        sync: false
+      - key: OPENROUTER_IMAGE_MODEL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: FACEBOOK_PAGE_ID
+        sync: false
+      - key: FACEBOOK_PAGE_TOKEN
+        sync: false
