@@ -2,6 +2,7 @@
 // Node 20+. No build step. Dependencies: express, node-cron.
 import express from "express";
 import cron from "node-cron";
+import crypto from "node:crypto";
 
 // ---------- Config ----------
 const env = (k, d = "") => (process.env[k] ?? d).trim();
@@ -10,7 +11,7 @@ const CFG = {
   port: Number(env("PORT", "10000")),
   site: env("SITE_URL", "https://vellurefragrances.com"),
   whatsapp: env("WHATSAPP_NUMBER"),
-  secret: env("WEBHOOK_SECRET"), // letters and digits only
+  secret: env("WEBHOOK_SECRET"), // any string; used for the x-admin-key header and to derive the webhook path
   publicUrl: env("PUBLIC_URL", env("RENDER_EXTERNAL_URL")),
   orKey: env("OPENROUTER_API_KEY"),
   textModel: env("OPENROUTER_TEXT_MODEL"),
@@ -26,6 +27,9 @@ const CFG = {
     .map((s) => s.trim())
     .filter(Boolean),
 };
+
+// URL-safe token derived from the secret (the raw secret may contain "/", "+", "=")
+const hookToken = crypto.createHash("sha256").update(CFG.secret || "none").digest("hex").slice(0, 40);
 
 const SCHEDULE = {
   product: env("CRON_PRODUCT", "0 16 * * *"), // 4:00 PM
@@ -336,7 +340,10 @@ async function revise(id, instruction) {
 async function handleUpdate(u) {
   const cb = u.callback_query;
   if (cb) {
-    if (String(cb.message?.chat?.id) !== CFG.tgChat) return;
+    if (String(cb.message?.chat?.id) !== CFG.tgChat) {
+      log("warn", "ignored button from other chat", { chatId: cb.message?.chat?.id, expected: CFG.tgChat });
+      return;
+    }
     await tg("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
     const [action, id] = String(cb.data).split(":");
     if (action === "ok") return approve(id);
@@ -347,7 +354,11 @@ async function handleUpdate(u) {
     return;
   }
   const m = u.message;
-  if (!m?.text || String(m.chat.id) !== CFG.tgChat) return;
+  if (!m?.text) return;
+  if (String(m.chat.id) !== CFG.tgChat) {
+    log("warn", "ignored message from other chat", { chatId: m.chat.id, expected: CFG.tgChat });
+    return;
+  }
   const text = m.text.trim();
   if (/^\/run\s+(product|reel|benefits)$/i.test(text)) return runSlot(text.split(/\s+/)[1].toLowerCase());
   if (/^(ok|okay|approve|approved)$/i.test(text)) return latestId ? approve(latestId) : notify("Kono pending draft nei.");
@@ -361,8 +372,14 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true, pending: pending.size }));
 
-app.post(`/telegram/:secret`, (req, res) => {
-  if (!CFG.secret || req.params.secret !== CFG.secret) return res.sendStatus(404);
+app.post(`/telegram/:token`, (req, res) => {
+  if (req.params.token !== hookToken) {
+    log("warn", "webhook hit with wrong token");
+    return res.sendStatus(404);
+  }
+  log("info", "telegram update received", {
+    type: req.body?.callback_query ? "button" : req.body?.message ? "message" : "other",
+  });
   res.sendStatus(200); // answer fast, work in background
   handleUpdate(req.body).catch((e) => log("error", "update handler failed", { error: e.message }));
 });
@@ -390,13 +407,20 @@ app.listen(CFG.port, async () => {
     log("info", "scheduled", { slotKey, expr });
   }
 
-  if (CFG.tgToken && CFG.secret && CFG.publicUrl) {
+  if (!CFG.publicUrl) log("error", "PUBLIC_URL / RENDER_EXTERNAL_URL is empty, webhook cannot be set");
+  if (CFG.tgToken && CFG.publicUrl) {
     try {
+      const base = CFG.publicUrl.replace(/\/$/, "");
       await tg("setWebhook", {
-        url: `${CFG.publicUrl.replace(/\/$/, "")}/telegram/${CFG.secret}`,
+        url: `${base}/telegram/${hookToken}`,
         allowed_updates: ["message", "callback_query"],
       });
-      log("info", "telegram webhook set");
+      const info = await tg("getWebhookInfo", {});
+      log("info", "telegram webhook set", {
+        host: base,
+        pending: info.pending_update_count,
+        lastError: info.last_error_message || null,
+      });
     } catch (e) {
       log("error", "setWebhook failed", { error: e.message });
     }

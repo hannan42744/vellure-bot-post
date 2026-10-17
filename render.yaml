@@ -22,7 +22,7 @@ services:
       - key: WHATSAPP_NUMBER
         sync: false
       - key: WEBHOOK_SECRET
-        generateValue: true   # letters and digits; copy it from the dashboard for /run calls
+        generateValue: true   # any characters are fine; copy it from the dashboard for the x-admin-key header
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_TEXT_MODEL
