@@ -24,7 +24,7 @@ const CFG = {
   tgToken: env("TELEGRAM_BOT_TOKEN"),
   tgChat: env("TELEGRAM_CHAT_ID"),
   fbPage: env("FACEBOOK_PAGE_ID"),
-  fbToken: env("FACEBOOK_PAGE_TOKEN"),
+  fbToken: env("FACEBOOK_PAGE_TOKEN").replace(/^["']|["']$/g, "").trim(),
   graph: env("GRAPH_VERSION", "v25.0"),
   products: env("PRODUCTS", "Armani Style,Desire,Aqua Di Gio,Vampire Blood")
     .split(",")
@@ -65,6 +65,17 @@ async function withRetry(fn, label, tries = 3) {
     }
   }
 }
+
+// Detect the real image format so the upload is labelled correctly (models may return JPEG/WebP)
+function sniffImage(buf) {
+  if (buf[0] === 0x89 && buf[1] === 0x50) return ["image/png", "png"];
+  if (buf[0] === 0xff && buf[1] === 0xd8) return ["image/jpeg", "jpg"];
+  if (buf.subarray(0, 4).toString() === "RIFF") return ["image/webp", "webp"];
+  return ["image/png", "png"];
+}
+
+// Page node: with a Page access token, "me" is the Page itself, so FACEBOOK_PAGE_ID is optional
+const fbNode = () => CFG.fbPage || "me";
 
 function missing(keys) {
   return keys.filter((k) => !CFG[k]);
@@ -311,7 +322,8 @@ async function sendPreview(id) {
     await withRetry(() => {
       const fd = new FormData();
       fd.append("chat_id", CFG.tgChat);
-      fd.append("photo", new Blob([p.image], { type: "image/png" }), "vellure.png");
+      const [mime, ext] = sniffImage(p.image);
+      fd.append("photo", new Blob([p.image], { type: mime }), `vellure.${ext}`);
       if (short) {
         fd.append("caption", body + hint);
         fd.append("reply_markup", JSON.stringify(buttons));
@@ -328,10 +340,11 @@ async function sendPreview(id) {
 async function postToFacebook(image, text) {
   return withRetry(async () => {
     const fd = new FormData();
-    fd.append("source", new Blob([image], { type: "image/png" }), "vellure.png");
+    const [mime, ext] = sniffImage(image);
+    fd.append("source", new Blob([image], { type: mime }), `vellure.${ext}`);
     fd.append("caption", text);
     fd.append("access_token", CFG.fbToken);
-    const res = await fetch(`https://graph.facebook.com/${CFG.graph}/${CFG.fbPage}/photos`, {
+    const res = await fetch(`https://graph.facebook.com/${CFG.graph}/${fbNode()}/photos`, {
       method: "POST",
       body: fd,
       signal: AbortSignal.timeout(90_000),
@@ -344,7 +357,7 @@ async function postToFacebook(image, text) {
 
 // Facebook Reels: start -> upload binary to rupload.facebook.com -> finish (publish)
 async function postReelToFacebook(video, text) {
-  const base = `https://graph.facebook.com/${CFG.graph}/${CFG.fbPage}/video_reels`;
+  const base = `https://graph.facebook.com/${CFG.graph}/${fbNode()}/video_reels`;
   const form = (obj) => ({
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -391,6 +404,30 @@ async function postReelToFacebook(video, text) {
     "fb reel finish"
   );
   return { ...done, video_id: start.video_id };
+}
+
+// Diagnostic: shows which Page the token belongs to and whether FACEBOOK_PAGE_ID matches it
+async function fbCheck() {
+  if (!CFG.fbToken) return "FACEBOOK_PAGE_TOKEN set kora nei.";
+  const get = async (path) => {
+    const sep = path.includes("?") ? "&" : "?";
+    const r = await fetch(
+      `https://graph.facebook.com/${CFG.graph}/${path}${sep}access_token=${encodeURIComponent(CFG.fbToken)}`,
+      { signal: AbortSignal.timeout(30_000) }
+    );
+    return { status: r.status, body: await r.json().catch(() => ({})) };
+  };
+  const me = await get("me?fields=id,name");
+  let msg = `Token (/me): ${me.status} ${JSON.stringify(me.body).slice(0, 300)}`;
+  if (CFG.fbPage) {
+    const pg = await get(`${CFG.fbPage}?fields=id,name`);
+    msg += `\nFACEBOOK_PAGE_ID (${CFG.fbPage}): ${pg.status} ${JSON.stringify(pg.body).slice(0, 300)}`;
+    if (me.body?.id && me.body.id !== CFG.fbPage)
+      msg += `\n⚠️ Token ta Page ${me.body.id} er, kintu FACEBOOK_PAGE_ID ${CFG.fbPage}. Env theke FACEBOOK_PAGE_ID muchhe din ba ${me.body.id} boshan.`;
+  } else {
+    msg += "\nFACEBOOK_PAGE_ID khali, bot token er Page e post korbe.";
+  }
+  return msg;
 }
 
 // ---------- Draft lifecycle ----------
@@ -441,7 +478,7 @@ async function approve(id) {
       pending.delete(id);
       return notify("✅ Reel concept approved. Video ta toiri kore nijer hate post korun.");
     }
-    const need = missing(["fbPage", "fbToken"]);
+    const need = missing(["fbToken"]);
     if (need.length) throw new Error(`Missing config: ${need.join(", ")}`);
     const text = renderText(p.slotKey, p.draft);
     const out = p.video ? await postReelToFacebook(p.video, text) : await postToFacebook(p.image, text);
@@ -510,7 +547,8 @@ async function handleUpdate(u) {
   const text = m.text.trim();
   if (/^\/run\s+(product|reel|benefits)$/i.test(text)) return runSlot(text.split(/\s+/)[1].toLowerCase());
   if (/^(ok|okay|approve|approved)$/i.test(text)) return latestId ? approve(latestId) : notify("Kono pending draft nei.");
-  if (text.startsWith("/")) return notify("Command: /run product | /run reel | /run benefits");
+  if (/^\/fbcheck$/i.test(text)) return fbCheck().then(notify).catch((e) => notify(`fbcheck failed: ${e.message}`));
+  if (text.startsWith("/")) return notify("Command: /fbcheck | /run product | /run reel | /run benefits");
   return revise(latestId, text);
 }
 
