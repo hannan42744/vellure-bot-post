@@ -17,6 +17,10 @@ const CFG = {
   textModel: env("OPENROUTER_TEXT_MODEL"),
   imageModel: env("OPENROUTER_IMAGE_MODEL"),
   imageModalities: env("OPENROUTER_IMAGE_MODALITIES", "image,text").split(","),
+  googleKey: env("GOOGLE_API_KEY"), // Drive API key (folder must be shared "Anyone with the link: Viewer")
+  driveFolder: env("DRIVE_FOLDER_ID"),
+  driveExclude: new RegExp(env("DRIVE_EXCLUDE", "cover|logo|banner"), "i"),
+  imageMode: env("IMAGE_MODE", "edit"), // "edit" = AI scene around your real photo, "real" = post the real photo as is
   videoModel: env("OPENROUTER_VIDEO_MODEL"),
   videoDuration: Number(env("VIDEO_DURATION", "5")),
   videoResolution: env("VIDEO_RESOLUTION", "720p"),
@@ -90,6 +94,96 @@ function productOfTheDay(offset = 0) {
   return CFG.products[(dayNumber() + offset) % CFG.products.length];
 }
 
+// ---------- Product catalog from Google Drive ----------
+const ALIASES = [
+  [/\balegant\b/g, "elegant"],
+  [/\bmask\b/g, "musk"],
+  [/\bamrmani\b/g, "armani"],
+  [/\bgental\s*man\b/g, "gentleman"],
+  [/\bgentalman\b/g, "gentleman"],
+  [/\bcrismon\b/g, "crimson"],
+];
+
+function productName(fileName) {
+  let n = fileName
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{2,4}$/i, "")
+    .replace(/\(\d+\)/g, " ")
+    .replace(/\b\d+\s*ml\b/g, " ")
+    .replace(/^vellure\s+/, "");
+  for (const [re, to] of ALIASES) n = n.replace(re, to);
+  n = n.replace(/\s*\d+\s*$/, "").replace(/\s+/g, " ").trim();
+  return n.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+let catalogCache = { at: 0, groups: null };
+
+async function loadCatalog() {
+  if (!CFG.googleKey || !CFG.driveFolder) return null;
+  if (catalogCache.groups && Date.now() - catalogCache.at < 6 * 3600_000) return catalogCache.groups;
+  const files = [];
+  let pageToken = "";
+  do {
+    const q = `'${CFG.driveFolder}' in parents and trashed=false and mimeType contains 'image/'`;
+    const url =
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}` +
+      `&fields=${encodeURIComponent("nextPageToken,files(id,name,mimeType)")}&pageSize=200` +
+      `&key=${CFG.googleKey}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw httpError("Google Drive list", res.status, data);
+    files.push(...(data.files || []));
+    pageToken = data.nextPageToken || "";
+  } while (pageToken);
+
+  const map = new Map();
+  for (const f of files) {
+    if (CFG.driveExclude.test(f.name)) continue;
+    const name = productName(f.name);
+    if (!name) continue;
+    if (!map.has(name)) map.set(name, { name, files: [] });
+    map.get(name).files.push(f);
+  }
+  const groups = [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+  catalogCache = { at: Date.now(), groups };
+  log("info", "catalog loaded", { photos: files.length, products: groups.length });
+  return groups;
+}
+
+async function downloadDriveFile(f) {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&key=${CFG.googleKey}`,
+    { signal: AbortSignal.timeout(60_000) }
+  );
+  if (!res.ok) throw httpError("Google Drive download", res.status, await res.text().catch(() => ""));
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Returns { name, buf, mime, fileName } or null when Drive is not configured / empty
+async function pickProduct(offset = 0, wanted = "") {
+  const groups = await loadCatalog();
+  if (!groups || !groups.length) return null;
+  let g;
+  if (wanted) {
+    g = groups.find((x) => x.name.toLowerCase().includes(wanted.toLowerCase()));
+    if (!g) throw new Error(`"${wanted}" nam e kono product pawa jay ni. /products diye list dekhun.`);
+  } else {
+    g = groups[(dayNumber() + offset) % groups.length];
+  }
+  const f = g.files[dayNumber() % g.files.length];
+  const buf = await withRetry(() => downloadDriveFile(f), "drive download");
+  return { name: g.name, buf, mime: f.mimeType, fileName: f.name };
+}
+
+// Short-lived public URL for a photo (OpenRouter fetches it as the video's first frame)
+const media = new Map();
+function mediaUrl(item) {
+  const token = crypto.randomBytes(12).toString("hex");
+  media.set(token, { buf: item.buf, mime: item.mime, exp: Date.now() + 40 * 60_000 });
+  for (const [k, v] of media) if (v.exp < Date.now()) media.delete(k);
+  return `${CFG.publicUrl.replace(/\/$/, "")}/media/${token}`;
+}
+
 // ---------- OpenRouter ----------
 async function orChat(body, timeoutMs) {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -153,6 +247,51 @@ async function generateImage(prompt) {
   }, "image generation");
 }
 
+// AI scene around the REAL product photo (the photo is sent to the image model as reference)
+async function editImage(prompt, item) {
+  return withRetry(async () => {
+    const data = await orChat(
+      {
+        model: CFG.imageModel,
+        modalities: CFG.imageModalities,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  `${prompt}\nThe attached photo is the exact product. Keep the bottle shape, colour, label and any text on it unchanged; ` +
+                  `change only the scene, background and lighting. Portrait 4:5, no extra text, no watermark.`,
+              },
+              { type: "image_url", image_url: { url: `data:${item.mime};base64,${item.buf.toString("base64")}` } },
+            ],
+          },
+        ],
+      },
+      180_000
+    );
+    const url = data?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
+    if (!url) throw new Error("OpenRouter returned no image");
+    if (url.startsWith("data:")) return Buffer.from(url.split(",")[1], "base64");
+    const r = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    if (!r.ok) throw httpError("Image download", r.status, "");
+    return Buffer.from(await r.arrayBuffer());
+  }, "image edit");
+}
+
+async function buildImage(draft, item) {
+  if (!item) return generateImage(draft.image_prompt);
+  if (CFG.imageMode === "real") return item.buf;
+  try {
+    return await editImage(draft.image_prompt, item);
+  } catch (e) {
+    log("warn", "image edit failed, using real photo", { error: e.message });
+    await notify(`⚠️ AI image toiri hoy ni, asol product photo ta use korchi.\n${e.message}`.slice(0, 600));
+    return item.buf;
+  }
+}
+
 async function orFetch(url, opts = {}, timeoutMs = 60_000) {
   return fetch(url, {
     ...opts,
@@ -168,7 +307,7 @@ async function orFetch(url, opts = {}, timeoutMs = 60_000) {
 }
 
 // Async job: submit -> poll -> download. Only the submit step is retried so a video is never paid for twice.
-async function generateVideo(prompt) {
+async function generateVideo(prompt, item) {
   const job = await withRetry(async () => {
     const res = await orFetch("https://openrouter.ai/api/v1/videos", {
       method: "POST",
@@ -179,6 +318,13 @@ async function generateVideo(prompt) {
         resolution: CFG.videoResolution,
         aspect_ratio: "9:16",
         generate_audio: CFG.videoAudio,
+        ...(item && CFG.publicUrl
+          ? {
+              frame_images: [
+                { type: "image_url", image_url: { url: mediaUrl(item) }, frame_type: "first_frame" },
+              ],
+            }
+          : {}),
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -227,29 +373,32 @@ const SLOTS = {
     label: "4:00 PM Product Showcase",
     image: true,
     publish: true,
-    prompt: () => `Product showcase post for today. Feature: ${productOfTheDay()}.
+    offset: 0,
+    prompt: (name) => `Product showcase post for today. Feature: ${name || productOfTheDay()}.
 Focus on premium scent, longevity and elegance. Return JSON with keys:
 product, caption (max 5 short lines, ends with ${cta()}), hashtags (10 hashtags mixing Bengali and English, one string),
-image_prompt (English, premium product photo, warm golden light, dark luxurious background, no people).`,
+image_prompt (English, a luxurious scene for this product: warm golden light, dark elegant background, soft smoke or petals, no people).`,
   },
   reel: {
     label: "6:00 PM Reel",
     image: false,
     video: true,
     publish: true,
-    prompt: () => `Short vertical Reel for today. Feature: ${productOfTheDay(1)}.
+    offset: 1,
+    prompt: (name, hasPhoto) => `Short vertical Reel for today. Feature: ${name || productOfTheDay(1)}.
 Return JSON with keys: hook (first 2 seconds, one line, Bengali), video_concept (2-3 lines in Bengali describing what the viewer sees),
 caption (punchy, trendy, ends with ${cta()}), hashtags (8 hashtags, one string),
-video_prompt (English, ONE continuous cinematic scene: elegant attar bottle, golden light, slow camera move, a drop of oil or soft smoke, dark luxurious background; no people, no hands, no on-screen text, no logos).`,
+video_prompt (English, ONE continuous cinematic shot. ${hasPhoto ? "The first frame is the real product photo, so describe ONLY gentle camera push-in, soft light shimmer and subtle atmosphere; do not change the bottle." : "Elegant attar bottle, golden light, slow camera move, soft smoke, dark luxurious background."} No people, no hands, no on-screen text, no logos).`,
   },
   benefits: {
     label: "7:00 PM Attar Benefits",
     image: true,
     publish: true,
-    prompt: () => `Educational/lifestyle post about why traditional attar is great for daily wear and office use
+    offset: 2,
+    prompt: (name) => `Educational/lifestyle post about why traditional attar is great for daily wear and office use
 (alcohol-free, long-lasting, concentrated oil, a little goes a long way). No medical or spiritual claims. Pick a fresh angle each day (seed ${dayNumber()}).
 Return JSON with keys: topic, caption (max 6 short lines, ends with a soft Vellure plug and ${cta()}),
-hashtags (10 hashtags, one string), image_prompt (English, calm lifestyle or attar-bottle photo, no people).`,
+hashtags (10 hashtags, one string), image_prompt (English, calm lifestyle scene with the attar bottle, no people).`,
   },
 };
 
@@ -444,7 +593,7 @@ function remember(state) {
   return id;
 }
 
-async function runSlot(slotKey) {
+async function runSlot(slotKey, wanted = "") {
   const slot = SLOTS[slotKey];
   if (!slot) throw new Error(`Unknown slot: ${slotKey}`);
   if (running.has(slotKey)) return log("warn", "slot already running", { slotKey });
@@ -456,11 +605,12 @@ async function runSlot(slotKey) {
     if (need.length) throw new Error(`Missing config: ${need.join(", ")}`);
     log("info", "slot started", { slotKey });
 
-    const draft = await generateJson(SYSTEM, slot.prompt());
+    const item = await pickProduct(slot.offset || 0, wanted);
+    const draft = await generateJson(SYSTEM, slot.prompt(item?.name, Boolean(item)));
     if (slot.video) await notify("🎬 Reel er video toiri hocche, 3-10 minute lagte pare...");
-    const image = slot.image ? await generateImage(draft.image_prompt) : null;
-    const video = slot.video ? await generateVideo(draft.video_prompt) : null;
-    const id = remember({ slotKey, label: slot.label, publish: slot.publish, image, video, draft });
+    const image = slot.image ? await buildImage(draft, item) : null;
+    const video = slot.video ? await generateVideo(draft.video_prompt, item) : null;
+    const id = remember({ slotKey, label: slot.label, publish: slot.publish, image, video, draft, item });
     await sendPreview(id);
     log("info", "preview sent", { slotKey, id });
   } catch (e) {
@@ -513,10 +663,10 @@ async function revise(id, instruction) {
     delete out.regenerate_image;
     delete out.regenerate_video;
     p.draft = { ...p.draft, ...out };
-    if (p.image && regen) p.image = await generateImage(p.draft.image_prompt);
+    if (p.image && regen) p.image = await buildImage(p.draft, p.item);
     if (p.video && regenVideo) {
       await sendText("🎬 Notun video toiri hocche, ektu opekkha korun...");
-      p.video = await generateVideo(p.draft.video_prompt);
+      p.video = await generateVideo(p.draft.video_prompt, p.item);
     }
     await sendPreview(id);
   } catch (e) {
@@ -549,7 +699,14 @@ async function handleUpdate(u) {
     return;
   }
   const text = m.text.trim();
-  if (/^\/run\s+(product|reel|benefits)$/i.test(text)) return runSlot(text.split(/\s+/)[1].toLowerCase());
+  const runCmd = text.match(/^\/run\s+(product|reel|benefits)(?:\s+(.+))?$/i);
+  if (runCmd) return runSlot(runCmd[1].toLowerCase(), (runCmd[2] || "").trim());
+  if (/^\/products$/i.test(text))
+    return loadCatalog()
+      .then((g) =>
+        notify(g ? `📦 ${g.length} product, ${g.reduce((n, x) => n + x.files.length, 0)} photo:\n` + g.map((x) => `• ${x.name} (${x.files.length})`).join("\n") : "Drive set kora nei (GOOGLE_API_KEY, DRIVE_FOLDER_ID).")
+      )
+      .catch((e) => notify(`Drive error: ${e.message}`));
   if (/^(ok|okay|approve|approved)$/i.test(text)) return latestId ? approve(latestId) : notify("Kono pending draft nei.");
   if (/^\/fbtest$/i.test(text)) {
     const png = Buffer.from(
@@ -561,7 +718,7 @@ async function handleUpdate(u) {
       .catch((e) => notify(`fbtest failed: ${e.message}`));
   }
   if (/^\/fbcheck$/i.test(text)) return fbCheck().then(notify).catch((e) => notify(`fbcheck failed: ${e.message}`));
-  if (text.startsWith("/")) return notify("Command: /fbcheck | /fbtest | /run product | /run reel | /run benefits");
+  if (text.startsWith("/")) return notify("Command: /products | /fbcheck | /fbtest | /run product [nam] | /run reel [nam] | /run benefits [nam]");
   return revise(latestId, text);
 }
 
@@ -570,6 +727,12 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true, pending: pending.size }));
+
+app.get("/media/:token", (req, res) => {
+  const m = media.get(req.params.token);
+  if (!m || m.exp < Date.now()) return res.sendStatus(404);
+  res.type(m.mime).send(m.buf);
+});
 
 app.post(`/telegram/:token`, (req, res) => {
   if (req.params.token !== hookToken) {

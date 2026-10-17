@@ -36,3 +36,10 @@ in Meta's docs and set `GRAPH_VERSION` if `v25.0` is retired.
 2. Open `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` in your browser (never share the token). Check `url` ends with `/telegram/<40 hex chars>`, and read `last_error_message`.
 3. Send `/run product`. Logs should show `telegram update received`. If not, the webhook is not arriving (step 1/2). If you see `ignored message from other chat`, fix `TELEGRAM_CHAT_ID`.
 4. Bypass Telegram inbound: `curl -X POST https://<service>.onrender.com/run/product -H "x-admin-key: <WEBHOOK_SECRET>"`. A preview or a "draft toiri hoy ni" message means outbound Telegram works; the text says what failed (model id, OpenRouter credit, etc).
+
+## Real product photos (Google Drive)
+- Share the Drive folder as "Anyone with the link: Viewer", create a Google API key (Drive API enabled), set `GOOGLE_API_KEY` and `DRIVE_FOLDER_ID`.
+- Products are grouped by file name (numbers, sizes like `6ml`, `(1)` and a few typos are ignored; files with "cover/logo/banner" are skipped). Telegram: `/products` lists them, `/run product Vampire Blood` picks one.
+- 4 PM and 7 PM: your real photo is sent to the image model as the exact product reference (`IMAGE_MODE=edit`) or posted as is (`IMAGE_MODE=real`). If the AI edit fails, the real photo is used.
+- 6 PM Reel: the real photo becomes the first frame (image-to-video). The bot serves it from `/media/<token>` for about 40 minutes so OpenRouter can fetch it.
+- AI can still bend labels and text on a bottle. Check the preview before approving.

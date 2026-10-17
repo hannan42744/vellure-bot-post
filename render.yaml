@@ -29,6 +29,12 @@ services:
         sync: false
       - key: OPENROUTER_IMAGE_MODEL
         sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: DRIVE_FOLDER_ID
+        sync: false
+      - key: IMAGE_MODE
+        value: edit
       - key: OPENROUTER_VIDEO_MODEL
         sync: false
       - key: VIDEO_DURATION
