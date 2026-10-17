@@ -17,11 +17,15 @@ const CFG = {
   textModel: env("OPENROUTER_TEXT_MODEL"),
   imageModel: env("OPENROUTER_IMAGE_MODEL"),
   imageModalities: env("OPENROUTER_IMAGE_MODALITIES", "image,text").split(","),
+  videoModel: env("OPENROUTER_VIDEO_MODEL"),
+  videoDuration: Number(env("VIDEO_DURATION", "5")),
+  videoResolution: env("VIDEO_RESOLUTION", "720p"),
+  videoAudio: env("VIDEO_AUDIO", "false") === "true",
   tgToken: env("TELEGRAM_BOT_TOKEN"),
   tgChat: env("TELEGRAM_CHAT_ID"),
   fbPage: env("FACEBOOK_PAGE_ID"),
   fbToken: env("FACEBOOK_PAGE_TOKEN"),
-  graph: env("GRAPH_VERSION", "v23.0"),
+  graph: env("GRAPH_VERSION", "v25.0"),
   products: env("PRODUCTS", "Armani Style,Desire,Aqua Di Gio,Vampire Blood")
     .split(",")
     .map((s) => s.trim())
@@ -138,6 +142,65 @@ async function generateImage(prompt) {
   }, "image generation");
 }
 
+async function orFetch(url, opts = {}, timeoutMs = 60_000) {
+  return fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${CFG.orKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": CFG.site,
+      "X-Title": "Vellure Content Bot",
+      ...(opts.headers || {}),
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+// Async job: submit -> poll -> download. Only the submit step is retried so a video is never paid for twice.
+async function generateVideo(prompt) {
+  const job = await withRetry(async () => {
+    const res = await orFetch("https://openrouter.ai/api/v1/videos", {
+      method: "POST",
+      body: JSON.stringify({
+        model: CFG.videoModel,
+        prompt,
+        duration: CFG.videoDuration,
+        resolution: CFG.videoResolution,
+        aspect_ratio: "9:16",
+        generate_audio: CFG.videoAudio,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw httpError("OpenRouter video submit", res.status, data);
+    return data;
+  }, "video submit", 2);
+
+  const pollUrl = job.polling_url || `https://openrouter.ai/api/v1/videos/${job.id}`;
+  const deadline = Date.now() + 12 * 60_000;
+  while (Date.now() < deadline) {
+    await sleep(15_000);
+    let st;
+    try {
+      const r = await orFetch(pollUrl);
+      st = await r.json().catch(() => ({}));
+      if (!r.ok) throw httpError("OpenRouter video poll", r.status, st);
+    } catch (e) {
+      log("warn", "video poll error", { error: e.message });
+      if ([401, 403, 404].includes(e.status)) throw e;
+      continue;
+    }
+    log("info", "video status", { status: st.status });
+    if (st.status === "failed") throw new Error(`Video generation failed: ${st.error || "unknown"}`);
+    if (st.status === "completed") {
+      const url = st.unsigned_urls?.[0] || `https://openrouter.ai/api/v1/videos/${job.id}/content?index=0`;
+      const r = await orFetch(url, {}, 180_000);
+      if (!r.ok) throw httpError("Video download", r.status, "");
+      return Buffer.from(await r.arrayBuffer());
+    }
+  }
+  throw new Error("Video generation timed out (12 minutes)");
+}
+
 // ---------- Content definitions ----------
 const SYSTEM = `You are the social media copywriter for Vellure, an online attar and perfume brand in Bangladesh.
 Tone: premium, warm, sophisticated. Write in Bengali script with light English words and emojis. Be concise and ready to publish.
@@ -159,12 +222,14 @@ product, caption (max 5 short lines, ends with ${cta()}), hashtags (10 hashtags 
 image_prompt (English, premium product photo, warm golden light, dark luxurious background, no people).`,
   },
   reel: {
-    label: "6:00 PM Reel Concept",
+    label: "6:00 PM Reel",
     image: false,
-    publish: false,
-    prompt: () => `Short Instagram/Facebook Reel idea for today. Feature: ${productOfTheDay(1)}.
-Return JSON with keys: hook (first 2 seconds, one line), video_concept (3-4 short shots, what to film),
-caption (punchy, trendy, ends with ${cta()}), hashtags (8 hashtags, one string).`,
+    video: true,
+    publish: true,
+    prompt: () => `Short vertical Reel for today. Feature: ${productOfTheDay(1)}.
+Return JSON with keys: hook (first 2 seconds, one line, Bengali), video_concept (2-3 lines in Bengali describing what the viewer sees),
+caption (punchy, trendy, ends with ${cta()}), hashtags (8 hashtags, one string),
+video_prompt (English, ONE continuous cinematic scene: elegant attar bottle, golden light, slow camera move, a drop of oil or soft smoke, dark luxurious background; no people, no hands, no on-screen text, no logos).`,
   },
   benefits: {
     label: "7:00 PM Attar Benefits",
@@ -190,7 +255,7 @@ async function tg(method, payload, form) {
     method: "POST",
     headers: form ? undefined : { "Content-Type": "application/json" },
     body: form ?? JSON.stringify(payload),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(120_000),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) throw httpError("Telegram", res.status, data);
@@ -220,6 +285,27 @@ async function sendPreview(id) {
     ],
   };
   const hint = "\n\n✏️ Change chaile ei chat e likhe din (jemon: caption chhoto koro).";
+  if (p.video) {
+    const mb = p.video.length / 1048576;
+    if (mb > 49) {
+      await sendText(`${body}\n\n⚠️ Video ${mb.toFixed(0)}MB, Telegram e preview pathano jay na, kintu Approve korle post hobe.${hint}`, { reply_markup: buttons });
+      return;
+    }
+    const short = (body + hint).length <= 1000;
+    await withRetry(() => {
+      const fd = new FormData();
+      fd.append("chat_id", CFG.tgChat);
+      fd.append("video", new Blob([p.video], { type: "video/mp4" }), "vellure-reel.mp4");
+      fd.append("supports_streaming", "true");
+      if (short) {
+        fd.append("caption", body + hint);
+        fd.append("reply_markup", JSON.stringify(buttons));
+      }
+      return tg("sendVideo", null, fd);
+    }, "telegram video");
+    if (!short) await sendText(body + hint, { reply_markup: buttons });
+    return;
+  }
   if (p.image) {
     const short = (body + hint).length <= 1000;
     await withRetry(() => {
@@ -256,6 +342,57 @@ async function postToFacebook(image, text) {
   }, "facebook post");
 }
 
+// Facebook Reels: start -> upload binary to rupload.facebook.com -> finish (publish)
+async function postReelToFacebook(video, text) {
+  const base = `https://graph.facebook.com/${CFG.graph}/${CFG.fbPage}/video_reels`;
+  const form = (obj) => ({
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(obj),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const check = async (res, label) => {
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.error || d.success === false) throw httpError(label, res.status, d);
+    return d;
+  };
+  const start = await withRetry(
+    async () => check(await fetch(base, form({ upload_phase: "start", access_token: CFG.fbToken })), "Facebook reel start"),
+    "fb reel start"
+  );
+  await withRetry(
+    async () =>
+      check(
+        await fetch(start.upload_url, {
+          method: "POST",
+          headers: { Authorization: `OAuth ${CFG.fbToken}`, offset: "0", file_size: String(video.length) },
+          body: video,
+          signal: AbortSignal.timeout(180_000),
+        }),
+        "Facebook reel upload"
+      ),
+    "fb reel upload"
+  );
+  const done = await withRetry(
+    async () =>
+      check(
+        await fetch(
+          base,
+          form({
+            upload_phase: "finish",
+            video_id: start.video_id,
+            video_state: "PUBLISHED",
+            description: text,
+            access_token: CFG.fbToken,
+          })
+        ),
+        "Facebook reel finish"
+      ),
+    "fb reel finish"
+  );
+  return { ...done, video_id: start.video_id };
+}
+
 // ---------- Draft lifecycle ----------
 const pending = new Map(); // id -> draft state (in memory)
 const running = new Set();
@@ -265,7 +402,7 @@ function remember(state) {
   const id = Date.now().toString(36);
   pending.set(id, state);
   latestId = id;
-  while (pending.size > 10) pending.delete(pending.keys().next().value);
+  while (pending.size > 5) pending.delete(pending.keys().next().value);
   return id;
 }
 
@@ -277,12 +414,15 @@ async function runSlot(slotKey) {
   try {
     const need = missing(["orKey", "textModel", "tgToken", "tgChat"]);
     if (slot.image && !CFG.imageModel) need.push("imageModel");
+    if (slot.video && !CFG.videoModel) need.push("videoModel");
     if (need.length) throw new Error(`Missing config: ${need.join(", ")}`);
     log("info", "slot started", { slotKey });
 
     const draft = await generateJson(SYSTEM, slot.prompt());
+    if (slot.video) await notify("🎬 Reel er video toiri hocche, 3-10 minute lagte pare...");
     const image = slot.image ? await generateImage(draft.image_prompt) : null;
-    const id = remember({ slotKey, label: slot.label, publish: slot.publish, image: slot.image && image, draft });
+    const video = slot.video ? await generateVideo(draft.video_prompt) : null;
+    const id = remember({ slotKey, label: slot.label, publish: slot.publish, image, video, draft });
     await sendPreview(id);
     log("info", "preview sent", { slotKey, id });
   } catch (e) {
@@ -303,10 +443,12 @@ async function approve(id) {
     }
     const need = missing(["fbPage", "fbToken"]);
     if (need.length) throw new Error(`Missing config: ${need.join(", ")}`);
-    const out = await postToFacebook(p.image, renderText(p.slotKey, p.draft));
+    const text = renderText(p.slotKey, p.draft);
+    const out = p.video ? await postReelToFacebook(p.video, text) : await postToFacebook(p.image, text);
+    const ref = out.post_id || out.id || out.video_id || "ok";
     pending.delete(id);
-    log("info", "published", { id, fb: out.post_id || out.id });
-    await notify(`✅ Facebook e post hoyeche (${out.post_id || out.id}).`);
+    log("info", "published", { id, fb: ref });
+    await notify(`✅ Facebook e post hoyeche (${ref}).`);
   } catch (e) {
     log("error", "publish failed", { id, error: e.message });
     await notify(`⚠️ Post korte parini, draft ta ekhono ache. Abar Approve chapte paren.\n${e.message}`.slice(0, 900));
@@ -323,12 +465,18 @@ async function revise(id, instruction) {
       SYSTEM,
       `Current draft JSON:\n${JSON.stringify(p.draft)}\n\nEdit instruction from the owner: "${instruction}"\n` +
         `Apply the instruction exactly and keep everything else. Return the full JSON with the same keys (${keys}) ` +
-        `plus "regenerate_image" (true only if the instruction changes how the picture should look).`
+        `plus "regenerate_image" and "regenerate_video" (each true only if the instruction changes how the picture or video should look).`
     );
     const regen = out.regenerate_image === true;
+    const regenVideo = out.regenerate_video === true;
     delete out.regenerate_image;
+    delete out.regenerate_video;
     p.draft = { ...p.draft, ...out };
     if (p.image && regen) p.image = await generateImage(p.draft.image_prompt);
+    if (p.video && regenVideo) {
+      await sendText("🎬 Notun video toiri hocche, ektu opekkha korun...");
+      p.video = await generateVideo(p.draft.video_prompt);
+    }
     await sendPreview(id);
   } catch (e) {
     log("error", "revision failed", { id, error: e.message });
@@ -393,7 +541,7 @@ app.post("/run/:slot", (req, res) => {
 
 app.listen(CFG.port, async () => {
   log("info", "server started", { port: CFG.port, tz: CFG.tz });
-  const need = missing(["secret", "orKey", "textModel", "imageModel", "tgToken", "tgChat"]);
+  const need = missing(["secret", "orKey", "textModel", "imageModel", "videoModel", "tgToken", "tgChat"]);
   if (need.length) log("warn", "config missing", { need });
 
   for (const [slotKey, expr] of Object.entries(SCHEDULE)) {

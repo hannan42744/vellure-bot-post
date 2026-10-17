@@ -18,7 +18,7 @@ services:
       - key: PRODUCTS
         value: Armani Style,Desire,Aqua Di Gio,Vampire Blood
       - key: GRAPH_VERSION
-        value: v23.0
+        value: v25.0
       - key: WHATSAPP_NUMBER
         sync: false
       - key: WEBHOOK_SECRET
@@ -29,6 +29,14 @@ services:
         sync: false
       - key: OPENROUTER_IMAGE_MODEL
         sync: false
+      - key: OPENROUTER_VIDEO_MODEL
+        sync: false
+      - key: VIDEO_DURATION
+        value: "5"
+      - key: VIDEO_RESOLUTION
+        value: 720p
+      - key: VIDEO_AUDIO
+        value: "false"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
