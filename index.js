@@ -337,12 +337,13 @@ async function sendPreview(id) {
 }
 
 // ---------- Facebook ----------
-async function postToFacebook(image, text) {
+async function postToFacebook(image, text, extra = {}) {
   return withRetry(async () => {
     const fd = new FormData();
     const [mime, ext] = sniffImage(image);
     fd.append("source", new Blob([image], { type: mime }), `vellure.${ext}`);
     fd.append("caption", text);
+    for (const [k, v] of Object.entries(extra)) fd.append(k, String(v));
     fd.append("access_token", CFG.fbToken);
     const res = await fetch(`https://graph.facebook.com/${CFG.graph}/${fbNode()}/photos`, {
       method: "POST",
@@ -488,7 +489,10 @@ async function approve(id) {
     await notify(`✅ Facebook e post hoyeche (${ref}).`);
   } catch (e) {
     log("error", "publish failed", { id, error: e.message });
-    await notify(`⚠️ Post korte parini, draft ta ekhono ache. Abar Approve chapte paren.\n${e.message}`.slice(0, 900));
+    let diag = "";
+    if (/Facebook/.test(e.message) && /"code":(100|190|200|10)\b/.test(e.message))
+      diag = "\n\n🔎 " + (await fbCheck().catch((x) => `fbcheck failed: ${x.message}`));
+    await notify(`⚠️ Post korte parini, draft ta ekhono ache. Abar Approve chapte paren.\n${e.message}${diag}`.slice(0, 2000));
   }
 }
 
@@ -547,8 +551,17 @@ async function handleUpdate(u) {
   const text = m.text.trim();
   if (/^\/run\s+(product|reel|benefits)$/i.test(text)) return runSlot(text.split(/\s+/)[1].toLowerCase());
   if (/^(ok|okay|approve|approved)$/i.test(text)) return latestId ? approve(latestId) : notify("Kono pending draft nei.");
+  if (/^\/fbtest$/i.test(text)) {
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64"
+    );
+    return postToFacebook(png, "Vellure test (unpublished)", { published: "false" })
+      .then((o) => notify(`✅ fbtest OK (unpublished photo): ${JSON.stringify(o).slice(0, 300)}`))
+      .catch((e) => notify(`fbtest failed: ${e.message}`));
+  }
   if (/^\/fbcheck$/i.test(text)) return fbCheck().then(notify).catch((e) => notify(`fbcheck failed: ${e.message}`));
-  if (text.startsWith("/")) return notify("Command: /fbcheck | /run product | /run reel | /run benefits");
+  if (text.startsWith("/")) return notify("Command: /fbcheck | /fbtest | /run product | /run reel | /run benefits");
   return revise(latestId, text);
 }
 
